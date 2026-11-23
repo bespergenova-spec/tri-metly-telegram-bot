@@ -3,9 +3,14 @@
 // Программная часть: брони ([BOOKING] -> bookings.json), напоминания, /bookings, /myid.
 // Без внешних зависимостей, нужен Node.js >= 20.6 (запуск: npm start).
 
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import {
+  CAFE_PHONE, CSV_HEADER, buildExtractPrompt, parseModelJson, normalizeExtraction,
+  emptyFields, mergeFields, validateFields, nextQuestion, hallFor, formatDate, formatSummary,
+  isYes, isNo, isCancel, csvLine,
+} from './application.js';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 
@@ -20,8 +25,9 @@ if (!TG_TOKEN || !OR_KEY) {
 
 const PROMPT_FILE = path.resolve(DIR, process.env.SYSTEM_PROMPT_FILE || 'system_prompt.md');
 const SYSTEM_PROMPT = readFileSync(PROMPT_FILE, 'utf8').trim();
+// Отдельный промпт для приёма заявок: модель возвращает только JSON.
+const EXTRACT_TEMPLATE = readFileSync(path.join(DIR, 'extract_prompt.md'), 'utf8').trim();
 
-const CAFE_PHONE = '+7 (700) 000-00-00';
 const TZ_OFFSET_H = 5; // Астана: UTC+5
 const TZ_NAME = 'Asia/Almaty';
 
@@ -53,6 +59,19 @@ const TG_API = `https://api.telegram.org/bot${TG_TOKEN}`;
 const histories = new Map(); // chatId -> [{role, content}]
 const busy = new Set(); // чаты, где уже идёт генерация
 const lastQuiz = new Map(); // chatId -> message_id вопроса квиза с активными кнопками
+const applications = new Map(); // chatId -> { fields, stage: 'collect' | 'confirm' } — заявка в работе
+
+// Слова, с которых начинается приём заявки.
+const BOOKING_TRIGGER = /брон|заяв|столик|резерв/i;
+
+const CONFIRM_KEYBOARD = {
+  inline_keyboard: [
+    [
+      { text: '✅ Да', callback_data: 'app:yes' },
+      { text: '✏️ Нет, поправить', callback_data: 'app:no' },
+    ],
+  ],
+};
 
 // ---------- Кнопки ----------
 
@@ -215,6 +234,24 @@ async function handleCallback(q) {
     tg('answerCallbackQuery', { callback_query_id: q.id, ...extra }).catch(() => {});
   const chatId = q.message?.chat.id;
   const data = q.data ?? '';
+  if (chatId && data.startsWith('app:')) {
+    const app = applications.get(chatId);
+    const messageId = q.message.message_id;
+    const setMarkup = (inline_keyboard) =>
+      tg('editMessageReplyMarkup', { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard } }).catch(() => {});
+    if (!app || app.stage !== 'confirm') {
+      await answer({ text: 'Эта заявка уже неактуальна' });
+      await setMarkup([]);
+      return;
+    }
+    if (busy.has(chatId)) return answer({ text: 'Минуточку, я ещё отвечаю…' });
+    const yes = data === 'app:yes';
+    await answer();
+    await setMarkup([[{ text: yes ? '✅ Подтверждено' : '✏️ Поправим', callback_data: 'noop' }]]);
+    await handleMessage({ chat: q.message.chat, text: yes ? 'да' : 'нет' });
+    return;
+  }
+
   if (!chatId || !data.startsWith('quiz:')) return answer();
 
   const letter = data.slice('quiz:'.length);
@@ -265,14 +302,14 @@ async function getImageDataUrl(msg) {
 
 // ---------- OpenRouter ----------
 
-async function askModel(model, messages) {
+async function askModel(model, messages, temperature = TEMPERATURE) {
   const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${OR_KEY}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ model, messages, max_tokens: 1500, temperature: TEMPERATURE }),
+    body: JSON.stringify({ model, messages, max_tokens: 1500, temperature }),
     signal: AbortSignal.timeout(90_000),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -282,10 +319,10 @@ async function askModel(model, messages) {
   return text;
 }
 
-async function askWithFallback(messages, models = MODELS) {
+async function askWithFallback(messages, models = MODELS, temperature = TEMPERATURE) {
   for (const model of models) {
     try {
-      const text = await askModel(model, messages);
+      const text = await askModel(model, messages, temperature);
       console.log(`[ok] ${model}`);
       return text;
     } catch (err) {
@@ -309,6 +346,114 @@ function buildSystemPrompt() {
 
 // ---------- Обработка сообщений ----------
 
+// ---------- Заявки через JSON ----------
+
+const BOOKINGS_CSV = path.join(DIR, 'bookings.csv');
+
+// Просим модель достать поля из сообщения гостя (ответ — только JSON).
+// Не получилось разобрать — повторяем один раз, дальше сдаёмся (null).
+async function extractApplication(text) {
+  const system = buildExtractPrompt(EXTRACT_TEMPLATE);
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const raw = await askWithFallback(
+        [{ role: 'system', content: system }, { role: 'user', content: text }],
+        MODELS,
+        0, // разбор данных — без креатива
+      );
+      const parsed = normalizeExtraction(parseModelJson(raw));
+      if (parsed) return parsed;
+      console.warn(`[application] попытка ${attempt}: ответ не похож на JSON: ${raw.slice(0, 150)}`);
+    } catch (err) {
+      console.warn(`[application] попытка ${attempt}: ${err.message}`);
+    }
+  }
+  return null;
+}
+
+function saveApplication(chatId, f) {
+  if (!existsSync(BOOKINGS_CSV)) appendFileSync(BOOKINGS_CSV, csvLine(CSV_HEADER), 'utf8');
+  const row = [new Date().toISOString(), chatId, f.name, f.phone, f.date, f.time, f.guests];
+  appendFileSync(BOOKINGS_CSV, csvLine(row), 'utf8');
+}
+
+async function finishApplication(chatId, app) {
+  const f = app.fields;
+  applications.delete(chatId);
+  saveApplication(chatId, f);
+  console.log(`[application] сохранена в bookings.csv: ${f.date} ${f.time}, ${f.name}, ${f.guests} гост.`);
+  // Заодно кладём бронь в bookings.json: оттуда работают /bookings, уведомление админу и напоминания.
+  await registerBooking(chatId, {
+    name: f.name,
+    date: formatDate(f.date),
+    time: f.time,
+    guests: f.guests,
+    phone: f.phone,
+    hall: hallFor(f.guests),
+    house: '',
+    comment: '',
+  });
+  await say(
+    chatId,
+    `Записала, ${f.name}! 📖 Администратор свяжется с вами по номеру ${f.phone} и подтвердит бронь. Накануне визита к вам прилетит сова 🦉`,
+  );
+}
+
+// Один шаг диалога заявки. true — сообщение обработано, false — не про бронь, пусть отвечает обычный чат.
+async function handleApplication(chatId, text) {
+  let app = applications.get(chatId);
+
+  if (isCancel(text)) {
+    if (!app) return false;
+    applications.delete(chatId);
+    await say(chatId, 'Хорошо, дорогуша, заявку отменила. Если передумаете, только скажите 🧹');
+    return true;
+  }
+
+  if (app?.stage === 'confirm') {
+    if (isYes(text)) {
+      await finishApplication(chatId, app);
+      return true;
+    }
+    if (isNo(text)) {
+      app.stage = 'collect';
+      await say(chatId, 'Что поправить, милый? Напишите, например: «время 20:00» или «нас будет пятеро» ✏️');
+      return true;
+    }
+    // Иначе гость сразу прислал правку: разбираем её как обычное сообщение.
+  }
+
+  const starting = !app;
+  const extracted = await extractApplication(text);
+  if (!extracted) {
+    await say(chatId, 'Ох, дорогуша, у меня расплылись чернила 🪶 Напишите заявку ещё раз: дату, время, число гостей, имя и телефон.');
+    return true;
+  }
+  if (extracted.intent !== 'booking') {
+    applications.delete(chatId);
+    return false;
+  }
+
+  if (!app) {
+    app = { fields: emptyFields(), stage: 'collect' };
+    applications.set(chatId, app);
+  }
+  const result = validateFields(mergeFields(app.fields, extracted.fields));
+  app.fields = result.fields;
+
+  const question = nextQuestion(result);
+  if (question) {
+    app.stage = 'collect';
+    const nothingYet = starting && Object.values(result.fields).every((v) => v === null) && !result.errors.length;
+    await say(chatId, nothingYet ? `С радостью, дорогуша! 🧹 ${question}` : question);
+    return true;
+  }
+
+  app.stage = 'confirm';
+  await say(chatId, `Проверим, дорогуша:\n\n${formatSummary(result.fields)}\n\nПодтверждаете?`, CONFIRM_KEYBOARD);
+  return true;
+}
+
 const GREETING =
   'Ох, заходите, заходите, не стойте на сквозняке! 🧹 Я мадам Розмерта, хозяйка «Трёх мётел». ' +
   'Могу показать меню, рассказать, когда мы открыты, или забронировать вам столик у камина. ' +
@@ -318,11 +463,17 @@ async function handleCommand(chatId, cmd) {
   switch (cmd) {
     case '/start':
       histories.delete(chatId);
+      applications.delete(chatId);
       await clearQuizButtons(chatId);
       await say(chatId, GREETING);
       return true;
+    case '/cancel':
+      applications.delete(chatId);
+      await say(chatId, 'Хорошо, дорогуша, ничего не записываю 🧹');
+      return true;
     case '/reset':
       histories.delete(chatId);
+      applications.delete(chatId);
       await clearQuizButtons(chatId);
       await say(chatId, 'Забыла всё, что мы говорили, дорогуша. Начнём с чистого пергамента? 📜');
       return true;
@@ -373,6 +524,11 @@ async function handleMessage(msg) {
   tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
 
   try {
+    // Заявка на бронь идёт отдельным потоком: JSON от модели + проверки в коде.
+    if (!hasImage && text && (applications.has(chatId) || BOOKING_TRIGGER.test(text))) {
+      if (await handleApplication(chatId, text)) return;
+    }
+
     const history = histories.get(chatId) ?? [];
     let userContent = text;
     let models = MODELS;
