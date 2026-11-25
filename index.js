@@ -138,6 +138,22 @@ function reminderUtc(date) {
   return Date.UTC(+d[3], +d[2] - 1, +d[1] - 1, 12 - TZ_OFFSET_H, 0);
 }
 
+// Разбирает ответ модели с тегами размышления.
+// Логирует <размышление> в консоль, возвращает только текст <ответ>.
+// Если тегов нет — убирает <размышление> (если есть) и возвращает остальное.
+function parseThinking(raw) {
+  const thinkMatch = /<размышление>([\s\S]*?)<\/размышление>/i.exec(raw);
+  if (thinkMatch) {
+    console.log('[размышление]\n' + thinkMatch[1].trim());
+  }
+  const answerMatch = /<ответ>([\s\S]*?)<\/ответ>/i.exec(raw);
+  if (answerMatch) {
+    return answerMatch[1].trim();
+  }
+  // Нет тегов <ответ> — убираем <размышление> и возвращаем остальное.
+  return raw.replace(/<размышление>[\s\S]*?<\/размышление>/gi, '').trim();
+}
+
 // Сообщения уходят как простой текст, поэтому markdown-разметка показывалась бы звёздочками.
 function stripMarkdown(text) {
   return text
@@ -309,7 +325,7 @@ async function askModel(model, messages, temperature = TEMPERATURE) {
       Authorization: `Bearer ${OR_KEY}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ model, messages, max_tokens: 1500, temperature }),
+    body: JSON.stringify({ model, messages, max_tokens: 4000, temperature }),
     signal: AbortSignal.timeout(90_000),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -569,11 +585,14 @@ async function handleMessage(msg) {
       return;
     }
 
-    // В историю — ответ целиком (с блоком), чтобы модель помнила, что бронь оформлена.
-    history.push({ role: 'assistant', content: answer });
+    // Извлекаем <ответ>, размышление уходит в лог — гость его не видит.
+    const parsed = parseThinking(answer);
+    // В историю — разобранный ответ (без <размышление>), но с [BOOKING], чтобы модель
+    // помнила, что бронь оформлена.
+    history.push({ role: 'assistant', content: parsed });
     histories.set(chatId, history.slice(-MAX_HISTORY));
 
-    const { text: rawVisible, booking } = extractBooking(answer);
+    const { text: rawVisible, booking } = extractBooking(parsed);
     const visible = stripMarkdown(rawVisible);
     if (booking) await registerBooking(chatId, booking);
     // Любой новый ответ делает прошлые кнопки квиза неактуальными.
