@@ -1,16 +1,17 @@
 // Сравнение ответов одной модели с выключенным и включённым рассуждением.
-// Берёт system_prompt.md и «Трудные вопросы» из test_cases.md, пишет comparison_effort.md.
+// Берёт system_prompt.md и «Трудные вопросы» из test_cases.md, пишет comparison.md.
 // Бота (index.js) не использует и не меняет.
 //
 // Проверка без запросов:  node --env-file=.env compare.js --dry-run
 // Запуск (6 запросов):    node --env-file=.env compare.js
+// Готовый отчёт не перезаписывается без флага --force.
 
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
-const OUT_FILE = path.join(DIR, 'comparison_effort.md');
+const OUT_FILE = path.join(DIR, 'comparison.md');
 const OR_KEY = process.env.OPENROUTER_API_KEY || process.env.API_KEY;
 
 const MODEL = 'nvidia/nemotron-3-ultra-550b-a55b:free';
@@ -161,6 +162,10 @@ if (process.argv.includes('--dry-run')) {
   questions.forEach((q, i) => console.log(`${i + 1}. ${q.title}: ${q.text}`));
   console.log(`Запросов будет: ${questions.length * EFFORTS.length}`);
 } else {
+  if (existsSync(OUT_FILE) && !process.argv.includes('--force')) {
+    console.error('comparison.md уже есть. Чтобы запустить заново и перезаписать его, добавьте --force');
+    process.exit(1);
+  }
   if (!OR_KEY) {
     console.error('Нужен API_KEY (или OPENROUTER_API_KEY) в .env');
     process.exit(1);
