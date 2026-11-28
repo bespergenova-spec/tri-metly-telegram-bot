@@ -164,7 +164,9 @@ export function validateFields(fields, nowMs = Date.now()) {
     if (!Number.isInteger(f.guests) || f.guests < 1) {
       bad('guests', 'Не поняла, сколько вас. Назовите число гостей 👥');
     } else if (f.guests > MAX_GUESTS) {
-      bad('guests', `Для компаний больше ${MAX_GUESTS} человек позвоните нам: ${CAFE_PHONE} 📞 Или назовите другое число гостей.`);
+      bad('guests', `Компании больше ${MAX_GUESTS} человек я через чат не бронирую, дорогуша. Позвоните нам: ${CAFE_PHONE} 📞`);
+      // Это сообщение гость должен увидеть первым, а не вопрос про другое время.
+      errors.unshift(errors.pop());
     }
   }
 

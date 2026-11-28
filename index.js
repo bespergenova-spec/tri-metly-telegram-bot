@@ -11,6 +11,7 @@ import {
   emptyFields, mergeFields, validateFields, nextQuestion, hallFor, formatDate, formatSummary,
   isYes, isNo, isCancel, csvLine,
 } from './application.js';
+import { effortFor, EFFORT_ON } from './router.js';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 
@@ -32,11 +33,12 @@ const TZ_OFFSET_H = 5; // Астана: UTC+5
 const TZ_NAME = 'Asia/Almaty';
 
 // Порядок важен: при ошибке (например, 429) пробуем следующую модель.
+// Первой идёт Nemotron Ultra: она поддерживает reasoning.effort «none» и «high».
 const MODELS = (process.env.MODELS ||
   [
+    'nvidia/nemotron-3-ultra-550b-a55b:free',
     'google/gemma-4-31b-it:free',
     'google/gemma-4-26b-a4b-it:free',
-    'nvidia/nemotron-3-ultra-550b-a55b:free',
     'nvidia/nemotron-3.5-super-vl:free',
   ].join(',')
 ).split(',').map((s) => s.trim()).filter(Boolean);
@@ -318,27 +320,33 @@ async function getImageDataUrl(msg) {
 
 // ---------- OpenRouter ----------
 
-async function askModel(model, messages, temperature = TEMPERATURE) {
+// effort: «high» — рассуждение включено (бронь, расчёты), «none» — выключено. См. router.js.
+async function askModel(model, messages, temperature, effort) {
   const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${OR_KEY}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ model, messages, max_tokens: 4000, temperature }),
+    body: JSON.stringify({ model, messages, max_tokens: 4000, temperature, reasoning: { effort } }),
     signal: AbortSignal.timeout(90_000),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
-  const text = data.choices?.[0]?.message?.content?.trim();
+  const message = data.choices?.[0]?.message;
+  const text = message?.content?.trim();
   if (!text) throw new Error('пустой ответ');
+  // Рассуждение видно только в консоли, гостю оно не отправляется.
+  const tokens = data.usage?.completion_tokens_details?.reasoning_tokens ?? 0;
+  console.log(`[reasoning] effort=${effort}, токенов рассуждения: ${tokens}`);
+  if (message.reasoning) console.log(`[размышление]\n${message.reasoning.trim()}`);
   return text;
 }
 
-async function askWithFallback(messages, models = MODELS, temperature = TEMPERATURE) {
+async function askWithFallback(messages, models, temperature, effort) {
   for (const model of models) {
     try {
-      const text = await askModel(model, messages, temperature);
+      const text = await askModel(model, messages, temperature, effort);
       console.log(`[ok] ${model}`);
       return text;
     } catch (err) {
@@ -376,6 +384,7 @@ async function extractApplication(text) {
         [{ role: 'system', content: system }, { role: 'user', content: text }],
         MODELS,
         0, // разбор данных — без креатива
+        EFFORT_ON, // бронь: рассуждение включено
       );
       const parsed = normalizeExtraction(parseModelJson(raw));
       if (parsed) return parsed;
@@ -577,7 +586,8 @@ async function handleMessage(msg) {
 
     let answer;
     try {
-      answer = await askWithFallback(messages, models);
+      // Рассуждение — только для брони и расчётов, для простых вопросов выключено.
+      answer = await askWithFallback(messages, models, TEMPERATURE, effortFor(text));
     } catch {
       history.pop(); // неудачный запрос не сохраняем
       histories.set(chatId, history);

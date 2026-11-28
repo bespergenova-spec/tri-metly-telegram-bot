@@ -80,6 +80,13 @@ test('validateFields: телефон и гости', () => {
   assert.equal(normalizePhone('12345'), null);
 });
 
+test('компания больше 20 человек: сразу телефон, без вопроса про другое время', () => {
+  const r = validateFields({ ...ok, date: '2026-11-29', time: '21:30', guests: 25 }, NOW);
+  assert.equal(r.errors[0].field, 'guests');
+  assert.match(nextQuestion(r), /\+7 \(700\) 000-00-00/);
+  assert.doesNotMatch(nextQuestion(r), /Во сколько|другое число/);
+});
+
 test('nextQuestion: один вопрос про первое недостающее поле', () => {
   const r = validateFields({ ...emptyFields(), date: '2026-11-27', name: 'Аскар' }, NOW);
   assert.deepEqual(r.missing, ['time', 'guests', 'phone']);
